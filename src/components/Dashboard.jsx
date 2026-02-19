@@ -11,7 +11,7 @@ import {
   ResponsiveContainer,
   Legend
 } from 'recharts'
-import { densityLabel, densityColour } from '../services/singstat'
+import { densityLabel, densityColour, getDataSourceLabel } from '../services/singstat'
 import './Dashboard.css'
 
 const DWELLING_COLOURS = {
@@ -215,7 +215,7 @@ export default function Dashboard({ data, planningArea, coords, error, areaSourc
       </div>
 
       <p className="dash-footer">
-        Source: Singapore Census 2020 (SingStat) · Map: OneMap (SLA)
+        Source: {getDataSourceLabel()} (SingStat) · Map: OneMap (SLA)
       </p>
     </aside>
   )

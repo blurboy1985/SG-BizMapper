@@ -1,12 +1,27 @@
 /**
  * SingStat Data Service
- * Uses embedded 2020 Census data for Singapore planning areas.
- * Source: https://www.singstat.gov.sg/publications/reference/cop2020
- * Live TableBuilder API: https://tablebuilder.singstat.gov.sg
+ * Fetches planning-area demographics from the SingStat Table Builder API.
+ * Falls back to embedded Census 2020 data when the API is unreachable.
+ *
+ * API docs: https://tablebuilder.singstat.gov.sg/view-api/for-developers
+ * Census:   https://www.singstat.gov.sg/publications/reference/cop2020
  */
 
+// ── SingStat Table Builder API ─────────────────────────────────────────────
+// Table IDs for Census of Population 2020 planning-area datasets.
+// Update these when newer census / GHS tables are published.
+const SINGSTAT_TABLES = {
+  population: '17561', // Resident Population by Planning Area, Ethnic Group and Sex
+  age:        '17560', // Resident Population by Planning Area, Age Group and Sex
+  dwelling:   '17574', // Resident Households by Planning Area and Type of Dwelling
+  income:     '17779'  // Resident Households by Planning Area and Monthly HH Income
+}
+
+let _apiCache = null       // merged demographics keyed by UPPERCASE planning area
+let _apiSourceLabel = null  // e.g. "Census of Population 2020"
+
 /**
- * 2020 Singapore Census — resident demographics by planning area.
+ * 2020 Singapore Census — resident demographics by planning area (fallback).
  * Fields: population, medianAge, medianHHIncome (SGD/month),
  *         dwellings { hdb, condo, landed, other } (% share),
  *         ageGroups { young (0-24), working (25-64), senior (65+) } (%)
@@ -366,26 +381,244 @@ const PLANNING_AREA_DATA = {
   }
 }
 
+// Land area (km²) per planning area, derived from embedded population/density.
+// Used to compute density from live population figures.
+const LAND_AREA_KM2 = Object.fromEntries(
+  Object.entries(PLANNING_AREA_DATA)
+    .filter(([, d]) => d.density > 0)
+    .map(([area, d]) => [area, d.population / d.density])
+)
+
+// ── API helpers ────────────────────────────────────────────────────────────
+
+async function fetchTable(tableId) {
+  const res = await fetch(`/singstat-api/table/tabledata/${tableId}`)
+  if (!res.ok) throw new Error(`SingStat API ${res.status}`)
+  return (await res.json()).Data
+}
+
+function parseVal(v) {
+  if (!v || v === '-' || v === 'na') return 0
+  return parseInt(String(v).replace(/,/g, ''), 10) || 0
+}
+
+/** Estimate median from 5-year age brackets using linear interpolation. */
+function estimateMedianAge(counts, total) {
+  if (!total) return 40
+  const brackets = [
+    ['0 - 4',0,5],['5 - 9',5,10],['10 - 14',10,15],['15 - 19',15,20],
+    ['20 - 24',20,25],['25 - 29',25,30],['30 - 34',30,35],['35 - 39',35,40],
+    ['40 - 44',40,45],['45 - 49',45,50],['50 - 54',50,55],['55 - 59',55,60],
+    ['60 - 64',60,65],['65 - 69',65,70],['70 - 74',70,75],['75 - 79',75,80],
+    ['80 - 84',80,85],['85 - 89',85,90],['90 & Over',90,95]
+  ]
+  const half = total / 2
+  let cum = 0
+  for (const [key, lo, hi] of brackets) {
+    cum += counts[key] || 0
+    if (cum >= half) {
+      const prev = cum - (counts[key] || 0)
+      return Math.round(lo + (half - prev) / (counts[key] || 1) * (hi - lo))
+    }
+  }
+  return 40
+}
+
+// ── Table parsers ──────────────────────────────────────────────────────────
+
+/** Table 17561 / 17560: planning-area rows end with " - Total". */
+function parsePARows(rows, hasSubzones) {
+  return rows
+    .filter(r => r.rowText !== 'Total')
+    .filter(r => !hasSubzones || r.rowText.endsWith(' - Total'))
+    .map(r => ({
+      area: (hasSubzones ? r.rowText.replace(/ - Total$/, '') : r.rowText)
+        .toUpperCase().trim(),
+      columns: r.columns
+    }))
+}
+
+function buildPopulationMap(rows) {
+  const map = {}
+  for (const { area, columns } of parsePARows(rows, true)) {
+    const g = columns.find(c => c.key === 'Total')
+    const t = g?.columns?.find(c => c.key === 'Total')
+    if (t) map[area] = parseVal(t.value)
+  }
+  return map
+}
+
+function buildAgeMap(rows) {
+  const young = ['0 - 4','5 - 9','10 - 14','15 - 19','20 - 24']
+  const working = ['25 - 29','30 - 34','35 - 39','40 - 44','45 - 49','50 - 54','55 - 59','60 - 64']
+  const senior = ['65 - 69','70 - 74','75 - 79','80 - 84','85 - 89','90 & Over']
+  const map = {}
+
+  for (const { area, columns } of parsePARows(rows, true)) {
+    const g = columns.find(c => c.key === 'Total')
+    if (!g?.columns) continue
+    const counts = {}
+    let total = 0
+    for (const col of g.columns) {
+      if (col.key === 'Total') { total = parseVal(col.value); continue }
+      counts[col.key] = parseVal(col.value)
+    }
+    const sum = keys => keys.reduce((s, k) => s + (counts[k] || 0), 0)
+    map[area] = {
+      ageGroups: {
+        young:   total ? Math.round(sum(young)   / total * 100) : 0,
+        working: total ? Math.round(sum(working) / total * 100) : 0,
+        senior:  total ? Math.round(sum(senior)  / total * 100) : 0
+      },
+      medianAge: estimateMedianAge(counts, total)
+    }
+  }
+  return map
+}
+
+function buildDwellingMap(rows) {
+  const map = {}
+  for (const { area, columns } of parsePARows(rows, false)) {
+    let total = 0, hdb = 0, condo = 0, landed = 0, other = 0
+    for (const col of columns) {
+      if (col.key === 'Total') { total = parseVal(col.value); continue }
+      if (col.key === 'HDB Dwellings') {
+        const t = col.columns?.find(c => c.key.startsWith('Total'))
+        hdb = t ? parseVal(t.value) : 0
+        continue
+      }
+      if (col.key === 'Condominiums and Other Apartments') { condo = parseVal(col.value); continue }
+      if (col.key === 'Landed Properties') { landed = parseVal(col.value); continue }
+      if (col.key === 'Others') { other = parseVal(col.value) }
+    }
+    if (total > 0) {
+      map[area] = {
+        hdb:    Math.round(hdb    / total * 100),
+        condo:  Math.round(condo  / total * 100),
+        landed: Math.round(landed / total * 100),
+        other:  Math.round(other  / total * 100)
+      }
+    }
+  }
+  return map
+}
+
+function buildIncomeMap(rows) {
+  const brackets = [
+    ['Below $1,000',0,1000],['$1,000 - $1,999',1000,2000],
+    ['$2,000 - $2,999',2000,3000],['$3,000 - $3,999',3000,4000],
+    ['$4,000 - $4,999',4000,5000],['$5,000 - $5,999',5000,6000],
+    ['$6,000 - $6,999',6000,7000],['$7,000 - $7,999',7000,8000],
+    ['$8,000 - $8,999',8000,9000],['$9,000 - $9,999',9000,10000],
+    ['$10,000 - $10,999',10000,11000],['$11,000 - $11,999',11000,12000],
+    ['$12,000 - $12,999',12000,13000],['$13,000 - $13,999',13000,14000],
+    ['$14,000 - $14,999',14000,15000],['$15,000 - $17,499',15000,17500],
+    ['$17,500 - $19,999',17500,20000],['$20,000 & Over',20000,30000]
+  ]
+  const map = {}
+  for (const { area, columns } of parsePARows(rows, false)) {
+    const counts = {}
+    let totalIncome = 0
+    for (const col of columns) {
+      if (col.key === 'Total' || col.key === 'No Employed Person') continue
+      const v = parseVal(col.value)
+      counts[col.key] = v
+      totalIncome += v
+    }
+    if (totalIncome > 0) {
+      const half = totalIncome / 2
+      let cum = 0
+      for (const [key, lo, hi] of brackets) {
+        cum += counts[key] || 0
+        if (cum >= half) {
+          const prev = cum - (counts[key] || 0)
+          map[area] = Math.round(lo + (half - prev) / (counts[key] || 1) * (hi - lo))
+          break
+        }
+      }
+    }
+  }
+  return map
+}
+
+// ── Fetch & merge ──────────────────────────────────────────────────────────
+
+async function fetchAllDemographics() {
+  if (_apiCache) return _apiCache
+
+  const [popData, ageData, dwellData, incomeData] = await Promise.all([
+    fetchTable(SINGSTAT_TABLES.population),
+    fetchTable(SINGSTAT_TABLES.age),
+    fetchTable(SINGSTAT_TABLES.dwelling),
+    fetchTable(SINGSTAT_TABLES.income)
+  ])
+
+  _apiSourceLabel = `${ageData.tableType || 'Census'} · Updated ${ageData.dataLastUpdated || 'N/A'}`
+
+  const popMap    = buildPopulationMap(popData.row)
+  const ageMap    = buildAgeMap(ageData.row)
+  const dwellMap  = buildDwellingMap(dwellData.row)
+  const incomeMap = buildIncomeMap(incomeData.row)
+
+  const allAreas = new Set([
+    ...Object.keys(popMap), ...Object.keys(ageMap),
+    ...Object.keys(dwellMap), ...Object.keys(incomeMap)
+  ])
+
+  const merged = {}
+  for (const area of allAreas) {
+    const pop = popMap[area] || 0
+    const landArea = LAND_AREA_KM2[area]
+    merged[area] = {
+      population:     pop,
+      medianAge:      ageMap[area]?.medianAge       ?? PLANNING_AREA_DATA[area]?.medianAge ?? 40,
+      medianHHIncome: incomeMap[area]               ?? PLANNING_AREA_DATA[area]?.medianHHIncome ?? 8000,
+      density:        landArea && pop ? Math.round(pop / landArea) : (PLANNING_AREA_DATA[area]?.density ?? 0),
+      dwellings:      dwellMap[area]                ?? PLANNING_AREA_DATA[area]?.dwellings ?? { hdb: 50, condo: 30, landed: 10, other: 10 },
+      ageGroups:      ageMap[area]?.ageGroups        ?? PLANNING_AREA_DATA[area]?.ageGroups ?? { young: 25, working: 60, senior: 15 }
+    }
+  }
+
+  _apiCache = merged
+  return merged
+}
+
 /**
  * Fetch demographic data for a planning area name.
- * First attempts a live call to the SingStat TableBuilder API;
- * falls back to embedded 2020 Census data if the call fails or the area
- * is not found in the live response.
+ * Tries the SingStat TableBuilder API first; falls back to embedded
+ * Census 2020 data if the API is unreachable or the area is missing.
  *
  * @param {string} planningArea  e.g. "CLEMENTI"
  * @returns {Promise<object|null>}
  */
 export async function getDemographics(planningArea) {
   const normalized = planningArea.toUpperCase().trim()
-  const embedded = PLANNING_AREA_DATA[normalized] ?? null
-  return embedded
+
+  try {
+    const live = await fetchAllDemographics()
+    if (live[normalized]) return live[normalized]
+  } catch {
+    // API unreachable — fall through to embedded data
+  }
+
+  return PLANNING_AREA_DATA[normalized] ?? null
 }
 
 /**
- * Returns all planning areas that have embedded data.
+ * Returns a human-readable label for the current data source.
+ * e.g. "Census of Population 2020 · Updated 18/06/2021" or "Census 2020 (embedded)"
+ */
+export function getDataSourceLabel() {
+  return _apiSourceLabel || 'Census 2020 (embedded)'
+}
+
+/**
+ * Returns all planning areas that have data (embedded + any from API cache).
  */
 export function getAllPlanningAreas() {
-  return Object.keys(PLANNING_AREA_DATA)
+  const areas = new Set(Object.keys(PLANNING_AREA_DATA))
+  if (_apiCache) Object.keys(_apiCache).forEach(a => areas.add(a))
+  return [...areas]
 }
 
 /**
